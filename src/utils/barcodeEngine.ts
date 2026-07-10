@@ -1,16 +1,12 @@
+import Quagga, { type QuaggaJSConfigObject, type QuaggaJSResultObject } from '@ericblade/quagga2'
 import { BrowserMultiFormatOneDReader } from '@zxing/browser'
 import { BarcodeFormat, DecodeHintType, NotFoundException } from '@zxing/library'
 
-const VIDEO_CONSTRAINTS: MediaStreamConstraints = {
-  video: {
-    facingMode: { ideal: 'environment' },
-    width: { ideal: 1920 },
-    height: { ideal: 1080 },
-    focusMode: { ideal: 'continuous' },
-  } as MediaTrackConstraints,
-}
-
+const QUAGGA_READERS = ['ean_reader', 'ean_8_reader', 'upc_reader', 'code_128_reader'] as const
 const PRODUCT_FORMATS = ['upc_a', 'upc_e', 'ean_13', 'ean_8', 'code_128'] as const
+const ENHANCED_SCALES = [1, 1.5, 2] as const
+const AUTO_TORCH_BRIGHTNESS = 75
+const REFOCUS_INTERVAL_MS = 2500
 
 export function normalizeBarcode(raw: string): string {
   return raw.replace(/\D/g, '')
@@ -27,6 +23,37 @@ function createZxingReader() {
   return new BrowserMultiFormatOneDReader(hints)
 }
 
+function createQuaggaConfig(target: HTMLElement): QuaggaJSConfigObject {
+  const workers = Math.min(navigator.hardwareConcurrency || 2, 4)
+
+  return {
+    inputStream: {
+      type: 'LiveStream',
+      target,
+      willReadFrequently: true,
+      constraints: {
+        facingMode: 'environment',
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        focusMode: 'continuous',
+      } as MediaTrackConstraints,
+    },
+    frequency: 20,
+    numOfWorkers: workers,
+    locate: true,
+    locator: {
+      halfSample: false,
+      patchSize: 'large',
+    },
+    canvas: {
+      createOverlay: false,
+    },
+    decoder: {
+      readers: [...QUAGGA_READERS],
+    },
+  }
+}
+
 async function createNativeDetector(): Promise<BarcodeDetector | null> {
   if (!('BarcodeDetector' in globalThis)) return null
   try {
@@ -39,22 +66,86 @@ async function createNativeDetector(): Promise<BarcodeDetector | null> {
   }
 }
 
-function drawCropFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
+function getVideoFromTarget(target: HTMLElement): HTMLVideoElement | null {
+  return target.querySelector('video')
+}
+
+function getStreamFromTarget(target: HTMLElement): MediaStream | null {
+  const video = getVideoFromTarget(target)
+  return video?.srcObject instanceof MediaStream ? video.srcObject : null
+}
+
+async function applyContinuousFocus(stream: MediaStream): Promise<void> {
+  const track = stream.getVideoTracks()[0]
+  if (!track) return
+
+  const caps = track.getCapabilities?.() as MediaTrackCapabilitiesWithTorch | undefined
+  if (!caps?.focusMode?.includes('continuous')) return
+
+  try {
+    await track.applyConstraints({
+      advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSetWithTorch],
+    })
+  } catch {
+    // ignored — not all devices support programmatic focus
+  }
+}
+
+async function triggerRefocus(stream: MediaStream): Promise<void> {
+  const track = stream.getVideoTracks()[0]
+  if (!track) return
+
+  const caps = track.getCapabilities?.() as MediaTrackCapabilitiesWithTorch | undefined
+  if (!caps?.focusMode) return
+
+  try {
+    if (caps.focusMode.includes('single-shot')) {
+      await track.applyConstraints({
+        advanced: [{ focusMode: 'single-shot' } as MediaTrackConstraintSetWithTorch],
+      })
+    }
+    if (caps.focusMode.includes('continuous')) {
+      await track.applyConstraints({
+        advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSetWithTorch],
+      })
+    }
+  } catch {
+    // ignored
+  }
+}
+
+function drawEnhancedFrame(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+): number | null {
   const vw = video.videoWidth
   const vh = video.videoHeight
-  if (vw <= 0 || vh <= 0) return false
+  if (vw <= 0 || vh <= 0) return null
 
-  const cropW = Math.floor(vw * 0.85)
-  const cropH = Math.floor(vh * 0.4)
-  const cropX = Math.floor((vw - cropW) / 2)
-  const cropY = Math.floor((vh - cropH) / 2)
-  const scale = 2
+  canvas.width = vw
+  canvas.height = vh
+  ctx.drawImage(video, 0, 0, vw, vh)
 
-  canvas.width = cropW * scale
-  canvas.height = cropH * scale
-  ctx.imageSmoothingEnabled = false
-  ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height)
-  return true
+  const imageData = ctx.getImageData(0, 0, vw, vh)
+  const pixels = imageData.data
+  let brightnessSum = 0
+  let samples = 0
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const gray = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2]
+    if (i % 16 === 0) {
+      brightnessSum += gray
+      samples += 1
+    }
+    const contrasted = Math.max(0, Math.min(255, (gray - 45) * (255 / 150)))
+    pixels[i] = contrasted
+    pixels[i + 1] = contrasted
+    pixels[i + 2] = contrasted
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+  return samples > 0 ? brightnessSum / samples : null
 }
 
 function decodeWithZxing(reader: BrowserMultiFormatOneDReader, canvas: HTMLCanvasElement): string | null {
@@ -66,78 +157,191 @@ function decodeWithZxing(reader: BrowserMultiFormatOneDReader, canvas: HTMLCanva
   }
 }
 
-export type BarcodeScanStop = () => void
+export type BarcodeScanHandle = {
+  stop: () => void
+  getStream: () => MediaStream | null
+  hasTorch: () => boolean
+  setTorch: (on: boolean) => Promise<boolean>
+  refocus: () => Promise<void>
+}
 
 export async function startBarcodeScan(
-  video: HTMLVideoElement,
+  target: HTMLElement,
   onDetected: (barcode: string) => void,
-): Promise<BarcodeScanStop> {
+  onAutoTorch?: (on: boolean) => void,
+): Promise<BarcodeScanHandle> {
   let stopped = false
-  const stream = await navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS)
-  video.srcObject = stream
-  video.setAttribute('playsinline', 'true')
-  await video.play()
+  let nativeFrameId: number | null = null
+  let enhancedIntervalId: number | null = null
+  let refocusIntervalId: number | null = null
+  let torchEnabled = false
+  let autoTorchTried = false
 
-  const [detector, reader] = await Promise.all([createNativeDetector(), Promise.resolve(createZxingReader())])
-  const canvas = document.createElement('canvas')
-  const ctx = canvas.getContext('2d', { willReadFrequently: true })
-  if (!ctx) throw new Error('Could not initialize scanner')
-  const canvasCtx = ctx
+  const zxingReader = createZxingReader()
+  const enhancedCanvas = document.createElement('canvas')
+  const enhancedCtx = enhancedCanvas.getContext('2d', { willReadFrequently: true })
+  const scaleCanvas = document.createElement('canvas')
+  const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true })
 
-  let busy = false
+  const acceptBarcode = (raw: string): boolean => {
+    if (stopped) return false
+    const value = normalizeBarcode(raw)
+    if (value.length < 8) return false
+    stopped = true
+    cleanup()
+    onDetected(value)
+    return true
+  }
 
-  async function tick() {
-    if (stopped || busy) return
-    if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
-      scheduleNext()
-      return
-    }
+  const handleQuaggaDetected = (result: QuaggaJSResultObject) => {
+    const raw = result.codeResult?.code
+    if (raw) acceptBarcode(raw)
+  }
 
-    busy = true
+  await new Promise<void>((resolve, reject) => {
+    Quagga.init(createQuaggaConfig(target), (err) => {
+      if (err) reject(err)
+      else resolve()
+    })
+  })
+
+  Quagga.onDetected(handleQuaggaDetected)
+  Quagga.start()
+
+  const stream = getStreamFromTarget(target)
+  if (stream) void applyContinuousFocus(stream)
+
+  const detector = await createNativeDetector()
+  const video = getVideoFromTarget(target)
+
+  async function tryNativeDetect(source: ImageBitmapSource): Promise<boolean> {
+    if (!detector) return false
     try {
-      if (!drawCropFrame(video, canvas, canvasCtx)) {
-        return
-      }
-
-      if (detector) {
-        for (const source of [video, canvas]) {
-          try {
-            const codes = await detector.detect(source)
-            if (codes.length > 0) {
-              const value = normalizeBarcode(codes[0].rawValue)
-              if (value.length >= 8) {
-                onDetected(value)
-                return
-              }
-            }
-          } catch {
-            // try next source
-          }
-        }
-      }
-
-      const zxingValue = decodeWithZxing(reader, canvas)
-      if (zxingValue && zxingValue.length >= 8) {
-        onDetected(zxingValue)
-      }
+      const codes = await detector.detect(source)
+      if (codes.length > 0) return acceptBarcode(codes[0].rawValue)
     } catch {
       // keep scanning
-    } finally {
-      busy = false
-      scheduleNext()
+    }
+    return false
+  }
+
+  async function tryEnhancedPass(): Promise<void> {
+    if (stopped || !video || !enhancedCtx || !scaleCtx) return
+    if (video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) return
+
+    const brightness = drawEnhancedFrame(video, enhancedCanvas, enhancedCtx)
+    if (brightness === null) return
+
+    if (
+      !autoTorchTried &&
+      brightness < AUTO_TORCH_BRIGHTNESS &&
+      stream &&
+      !torchEnabled
+    ) {
+      autoTorchTried = true
+      const track = stream.getVideoTracks()[0]
+      const caps = track?.getCapabilities?.() as MediaTrackCapabilitiesWithTorch | undefined
+      if (caps?.torch) {
+        try {
+          await track.applyConstraints({
+            advanced: [{ torch: true } as MediaTrackConstraintSetWithTorch],
+          })
+          torchEnabled = true
+          onAutoTorch?.(true)
+        } catch {
+          // ignored
+        }
+      }
+    }
+
+    if (await tryNativeDetect(enhancedCanvas)) return
+
+    for (const scale of ENHANCED_SCALES) {
+      scaleCanvas.width = Math.floor(enhancedCanvas.width * scale)
+      scaleCanvas.height = Math.floor(enhancedCanvas.height * scale)
+      scaleCtx.imageSmoothingEnabled = scale !== 1
+      scaleCtx.drawImage(enhancedCanvas, 0, 0, scaleCanvas.width, scaleCanvas.height)
+
+      const zxingValue = decodeWithZxing(zxingReader, scaleCanvas)
+      if (zxingValue && zxingValue.length >= 8 && acceptBarcode(zxingValue)) return
     }
   }
 
-  function scheduleNext() {
-    if (!stopped) window.setTimeout(tick, 80)
+  if (detector && video) {
+    const nativeTick = async () => {
+      if (stopped) return
+      if (video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+        if (await tryNativeDetect(video)) return
+      }
+      nativeFrameId = requestAnimationFrame(() => {
+        void nativeTick()
+      })
+    }
+    void nativeTick()
   }
 
-  tick()
+  enhancedIntervalId = window.setInterval(() => {
+    void tryEnhancedPass()
+  }, 100)
 
-  return () => {
-    stopped = true
-    stream.getTracks().forEach((track) => track.stop())
-    video.srcObject = null
+  if (stream) {
+    refocusIntervalId = window.setInterval(() => {
+      if (!stopped) void triggerRefocus(stream)
+    }, REFOCUS_INTERVAL_MS)
+  }
+
+  function cleanup() {
+    if (nativeFrameId !== null) {
+      cancelAnimationFrame(nativeFrameId)
+      nativeFrameId = null
+    }
+    if (enhancedIntervalId !== null) {
+      window.clearInterval(enhancedIntervalId)
+      enhancedIntervalId = null
+    }
+    if (refocusIntervalId !== null) {
+      window.clearInterval(refocusIntervalId)
+      refocusIntervalId = null
+    }
+    Quagga.offDetected(handleQuaggaDetected)
+    void Quagga.stop()
+  }
+
+  return {
+    stop: () => {
+      if (stopped) return
+      stopped = true
+      cleanup()
+    },
+    getStream: () => getStreamFromTarget(target),
+    hasTorch: () => {
+      const activeStream = getStreamFromTarget(target)
+      const track = activeStream?.getVideoTracks()[0]
+      const caps = track?.getCapabilities?.() as MediaTrackCapabilitiesWithTorch | undefined
+      return Boolean(caps?.torch)
+    },
+    setTorch: async (on: boolean) => {
+      const activeStream = getStreamFromTarget(target)
+      const track = activeStream?.getVideoTracks()[0]
+      if (!track) return false
+
+      const caps = track.getCapabilities?.() as MediaTrackCapabilitiesWithTorch | undefined
+      if (!caps?.torch) return false
+
+      try {
+        await track.applyConstraints({
+          advanced: [{ torch: on } as MediaTrackConstraintSetWithTorch],
+        })
+        torchEnabled = on
+        return true
+      } catch {
+        return false
+      }
+    },
+    refocus: async () => {
+      const activeStream = getStreamFromTarget(target)
+      if (activeStream) await triggerRefocus(activeStream)
+    },
   }
 }
 

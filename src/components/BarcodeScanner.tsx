@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getCameraErrorMessage, normalizeBarcode, startBarcodeScan, type BarcodeScanStop } from '../utils/barcodeEngine'
+import {
+  getCameraErrorMessage,
+  normalizeBarcode,
+  startBarcodeScan,
+  type BarcodeScanHandle,
+} from '../utils/barcodeEngine'
 
 interface BarcodeScannerProps {
   onScan: (barcode: string) => void
@@ -7,39 +12,44 @@ interface BarcodeScannerProps {
 }
 
 export function BarcodeScanner({ onScan, onManualEntry }: BarcodeScannerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const stopScanRef = useRef<BarcodeScanStop | null>(null)
+  const scannerTargetRef = useRef<HTMLDivElement>(null)
+  const scanHandleRef = useRef<BarcodeScanHandle | null>(null)
   const onScanRef = useRef(onScan)
   const scannedRef = useRef(false)
+  const autoStartedRef = useRef(false)
 
   const [cameraState, setCameraState] = useState<'idle' | 'starting' | 'active' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
   const [manualBarcode, setManualBarcode] = useState('')
-  const [scanHint, setScanHint] = useState('Tap Start Camera, then align the barcode in the green box.')
+  const [torchOn, setTorchOn] = useState(false)
+  const [torchAvailable, setTorchAvailable] = useState(false)
+  const [scanHint, setScanHint] = useState('Tap the screen if the barcode looks blurry.')
 
   onScanRef.current = onScan
 
   const stopCamera = useCallback(() => {
-    stopScanRef.current?.()
-    stopScanRef.current = null
+    scanHandleRef.current?.stop()
+    scanHandleRef.current = null
+    setTorchOn(false)
+    setTorchAvailable(false)
     setCameraState('idle')
-    setScanHint('Tap Start Camera, then align the barcode in the green box.')
+    setScanHint('Tap the screen if the barcode looks blurry.')
   }, [])
 
-  const handleDetected = useCallback(
-    (raw: string) => {
-      if (scannedRef.current) return
-      scannedRef.current = true
-      stopScanRef.current?.()
-      stopScanRef.current = null
-      setScanHint(`Found: ${raw}`)
-      onScanRef.current(raw)
-    },
-    [],
-  )
+  const handleDetected = useCallback((raw: string) => {
+    if (scannedRef.current) return
+    scannedRef.current = true
+    scanHandleRef.current?.stop()
+    scanHandleRef.current = null
+    setTorchOn(false)
+    setTorchAvailable(false)
+    setScanHint(`Found: ${raw}`)
+    onScanRef.current(raw)
+  }, [])
 
   const startCamera = useCallback(async () => {
-    if (!videoRef.current) return
+    const target = scannerTargetRef.current
+    if (!target) return
     if (cameraState === 'starting') return
 
     stopCamera()
@@ -49,9 +59,13 @@ export function BarcodeScanner({ onScan, onManualEntry }: BarcodeScannerProps) {
     setScanHint('Starting camera…')
 
     try {
-      stopScanRef.current = await startBarcodeScan(videoRef.current, handleDetected)
+      const handle = await startBarcodeScan(target, handleDetected, (on) => {
+        setTorchOn(on)
+      })
+      scanHandleRef.current = handle
+      setTorchAvailable(handle.hasTorch())
       setCameraState('active')
-      setScanHint('Scanning… hold the barcode steady inside the green box.')
+      setScanHint('If it won\u2019t scan, tap the screen to focus or move back slightly.')
     } catch (err) {
       stopCamera()
       setCameraState('error')
@@ -59,17 +73,42 @@ export function BarcodeScanner({ onScan, onManualEntry }: BarcodeScannerProps) {
     }
   }, [cameraState, stopCamera, handleDetected])
 
+  const toggleTorch = useCallback(async () => {
+    const handle = scanHandleRef.current
+    if (!handle) return
+    const next = !torchOn
+    const ok = await handle.setTorch(next)
+    if (ok) setTorchOn(next)
+  }, [torchOn])
+
+  const handleViewportTap = useCallback(() => {
+    if (cameraState !== 'active') return
+    void scanHandleRef.current?.refocus()
+    setScanHint('Refocusing… hold steady.')
+    window.setTimeout(() => {
+      setScanHint('If it won\u2019t scan, tap the screen to focus or move back slightly.')
+    }, 1200)
+  }, [cameraState])
+
+  useEffect(() => {
+    if (!window.isSecureContext || autoStartedRef.current) return
+    autoStartedRef.current = true
+    void startCamera()
+  }, [startCamera])
+
   useEffect(() => {
     return () => {
-      stopScanRef.current?.()
-      stopScanRef.current = null
+      scanHandleRef.current?.stop()
+      scanHandleRef.current = null
     }
   }, [])
 
   function handleManualSubmit(e: React.FormEvent) {
     e.preventDefault()
     const code = normalizeBarcode(manualBarcode)
-    if (code) onManualEntry(code)
+    if (!code) return
+    stopCamera()
+    onManualEntry(code)
   }
 
   return (
@@ -77,9 +116,14 @@ export function BarcodeScanner({ onScan, onManualEntry }: BarcodeScannerProps) {
       <h2 className="section-title">Scan Barcode</h2>
       <p className="section-subtitle">Point your camera at a product barcode (UPC/EAN)</p>
 
-      <div className="scanner-viewport">
-        <video ref={videoRef} className="scanner-video" playsInline muted autoPlay />
-        {cameraState === 'active' && <div className="scanner-overlay" />}
+      <div className="scanner-viewport" onClick={handleViewportTap}>
+        <div ref={scannerTargetRef} className="scanner-target" />
+        {cameraState === 'active' && (
+          <>
+            <div className="scanner-overlay" />
+            <div className="scanner-scanline" aria-hidden="true" />
+          </>
+        )}
         {cameraState !== 'active' && (
           <div className="scanner-placeholder">
             {cameraState === 'starting' ? (
@@ -96,9 +140,16 @@ export function BarcodeScanner({ onScan, onManualEntry }: BarcodeScannerProps) {
       <p className={`scanner-status ${cameraState === 'active' ? 'scanner-status--active' : ''}`}>{scanHint}</p>
 
       {cameraState === 'active' && (
-        <button type="button" className="btn btn--secondary btn--full scanner-stop-btn" onClick={stopCamera}>
-          Stop Camera
-        </button>
+        <div className="scanner-controls">
+          {torchAvailable && (
+            <button type="button" className="btn btn--secondary scanner-torch-btn" onClick={toggleTorch}>
+              {torchOn ? 'Turn Off Flash' : 'Turn On Flash'}
+            </button>
+          )}
+          <button type="button" className="btn btn--secondary btn--full scanner-stop-btn" onClick={stopCamera}>
+            Stop Camera
+          </button>
+        </div>
       )}
 
       {cameraState === 'error' && (

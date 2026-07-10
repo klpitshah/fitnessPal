@@ -801,16 +801,65 @@ button { cursor: pointer; }
 
 .scanner-placeholder p { color: #ffffff; font-size: 0.9375rem; }
 
-.scanner-video { width: 100%; height: 100%; object-fit: cover; }
+.scanner-target {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.scanner-target video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.scanner-target canvas.drawingBuffer {
+  display: none;
+}
 
 .scanner-overlay {
   position: absolute;
-  inset: 18% 8%;
+  inset: 30% 4%;
   border: 2px solid var(--color-primary);
   border-radius: var(--radius-sm);
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35);
   pointer-events: none;
 }
+
+.scanner-scanline {
+  position: absolute;
+  left: 4%;
+  right: 4%;
+  top: 30%;
+  height: 40%;
+  pointer-events: none;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+}
+
+.scanner-scanline::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--color-primary), transparent);
+  animation: scanner-sweep 2s ease-in-out infinite;
+}
+
+@keyframes scanner-sweep {
+  0%, 100% { top: 0; opacity: 0.4; }
+  50% { top: calc(100% - 2px); opacity: 1; }
+}
+
+.scanner-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  margin-top: 0.75rem;
+}
+
+.scanner-torch-btn { width: 100%; }
 
 .scanner-status {
   margin-top: 0.75rem;
